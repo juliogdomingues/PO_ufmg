@@ -9,8 +9,8 @@ class SimplexArgs:
     def __init__(self):
         self.filename = ""  
         self.decimals = 3
-        self.digits = 7  # Updated default to match argparse
-        self.policy = "largest"
+        self.digits = 7
+        self.policy = "largest"  # Pivot selection policy
 
 class SimplexConfig:
     def __init__(self):
@@ -72,18 +72,30 @@ def parse_cli_args():
 
 def print_matrix(mat):
     """Print a matrix with proper alignment and borders."""
+    # Check if mat is a NumPy array
+    if isinstance(mat, np.ndarray):
+        if mat.size == 0 or mat.shape[1] == 0:
+            print("Matriz vazia.")
+            return
+        mat = mat.tolist()  # Convert to list of lists for processing
+    elif not mat or not mat[0]:
+        # Handle edge case if matrix is empty
+        print("Matriz vazia.")
+        return
+
     formatted = [[CONFIG.number_format.format(val) for val in row] for row in mat]
     col_widths = [
-        max(len(formatted[r][c]) for r in range(len(mat))) for c in range(len(mat[0]))
+        max(len(formatted[r][c]) for r in range(len(mat))) 
+        for c in range(len(mat[0]))
     ]
     total_width = sum(col_widths[:-1]) + 3 * (len(col_widths) - 1)
     rhs_width = col_widths[-1]
     split_pos = len(mat) - 1  # Position after slack variables
 
-    print("-" * total_width + "-" * 5 + "-" * rhs_width)
+    print("-" * (total_width + 5 + rhs_width))
     for i, row in enumerate(formatted):
         if i == 1:
-            print("-" * total_width + "-" * 5 + "-" * rhs_width)
+            print("-" * (total_width + 5 + rhs_width))
         print("|", end=" ")
         for j, (value, width) in enumerate(zip(row, col_widths)):
             if j == split_pos:
@@ -92,7 +104,7 @@ def print_matrix(mat):
                 print("|", end=" ")
             print(value.rjust(width), end=" ")
         print("|")
-    print("-" * total_width + "-" * 5 + "-" * rhs_width)
+    print("-" * (total_width + 5 + rhs_width))
 
 def parse_objective_function(f, num_vars, var_types):
     """
@@ -110,7 +122,7 @@ def parse_objective_function(f, num_vars, var_types):
         if var_types[i] == -1:
             coef *= -1
         elif var_types[i] == 0:
-            # For free variables, we effectively split them into x+ and x-
+            # For free variables, effectively split them into x+ and x-
             coefs.append(-int(line[i + 1]) * obj_sign)
 
         coefs.append(coef)
@@ -151,15 +163,17 @@ def parse_constraints(f, num_cons, num_vars, var_types):
 def convert_problem_to_standard_form(num_rows, num_cols, mat, obj_coefs, rhs, eq_flags):
     """
     Converts the problem to standard form (adds slack variables and RHS column).
-    eq_flags[i] = 1 if equality constraint, 0 otherwise.
+    eq_flags[i] = 1 if equality constraint, 0 otherwise (i.e. <= or >=).
     """
     for i in range(len(eq_flags)):
+        # If this is not an equality constraint, add a slack variable
         if not eq_flags[i]:
             obj_coefs.append(0)
             num_cols += 1
             for r in range(num_rows):
                 mat[r].append(1 if i == r else 0)
 
+    # Append RHS to the end of each row
     for r in range(num_rows):
         mat[r].append(rhs[r])
 
@@ -179,7 +193,9 @@ def make_matrix_full_rank(A):
     while True:
         counter += 1
         B = A[: row_idx + 1, :]
+        # Using QR decomposition to detect dependence
         C = np.linalg.qr(B.T)[1]
+        # Zero out near-zero values
         C[np.isclose(C, 0)] = 0
         if row_idx >= C.shape[0]:
             break
@@ -203,7 +219,7 @@ def parse_input():
         objective = parse_objective_function(f, num_vars, var_types)
         mat, rhs, eq_flags, num_vars = parse_constraints(f, num_cons, num_vars, var_types)
 
-        # Check if we can remove dependent rows
+        # Check if can remove dependent rows
         eliminated_rows = []
         mat_array = np.array(mat)
         original_rank = np.linalg.matrix_rank(mat_array)
@@ -237,23 +253,32 @@ def parse_input():
     return num_cons, num_vars, objective, mat, var_types
 
 def initialize_tableau(rows, cols, obj_coefs, mat):
-    """Creates the initial simplex tableau."""
+    """
+    Creates the initial simplex tableau.
+    Rows: number of constraints
+    Cols: number of columns (including slack vars, but not counting the RHS)
+    """
+    # Store (rows+1) for the objective row, 
+    # and (cols+rows) columns for the slack columns + original columns,
+    # with one more column to come for the RHS
     tableau = np.zeros((rows + 1, cols + rows), dtype=float)
 
-    # Identity matrix on the left
+    # Put an identity matrix in columns [0..rows-1] for the basic slack variables
     for i in range(rows):
         tableau[i + 1, i] = 1
 
-    # Objective row (negative for maximization in tableau)
+    # Objective row (negative of the objective for maximization)
     for c in range(cols - 1):
         tableau[0, c + rows] = -obj_coefs[c]
 
-    # Constraints
+    # Constraints go in rows [1..rows] and columns [rows..rows+cols-1]
     for r in range(rows):
         for c in range(cols):
             tableau[r + 1, c + rows] = mat[r][c]
 
+    # Expand total columns to include the slack ones
     cols += rows
+    # One more row for the objective
     rows += 1
 
     print("Tableau Inicial:")
@@ -263,8 +288,13 @@ def initialize_tableau(rows, cols, obj_coefs, mat):
     return tableau, rows, cols
 
 def identify_basis_vars(tableau, rows, cols):
-    """Identifies basic and non-basic variables in the tableau."""
-    non_basic = set(range(1, rows))  # row indices for potential basic variables
+    """
+    Identifies basic and non-basic variables in the tableau.
+
+    Basic variables typically form an identity matrix in 
+    columns among the constraint rows.
+    """
+    non_basic = set(range(1, rows))  # Store row indices for potential basis
     basic = []
 
     for col in range(rows - 1, cols - 1):
@@ -272,7 +302,6 @@ def identify_basis_vars(tableau, rows, cols):
         row_idx = -1
         for r in range(1, rows):
             val = tableau[r, col]
-            # Must be exactly 0 or 1 (with tolerance) for potential basis
             if val < -CONFIG.epsilon or val > 1 + CONFIG.epsilon:
                 count_ones = 0
                 break
@@ -318,8 +347,11 @@ def pivot(tableau, row_p, col_p):
       1. Normalize the pivot row
       2. Zero out the pivot column in other rows
     """
+    # Divide the pivot row by the pivot element to make it 1
     tableau[row_p] /= tableau[row_p, col_p]
     pivot_val = tableau[row_p, col_p]
+
+    # Eliminate the column entry in other rows
     for r in range(len(tableau)):
         if r != row_p and abs(tableau[r, col_p]) > CONFIG.epsilon:
             factor = tableau[r, col_p]
@@ -328,20 +360,20 @@ def pivot(tableau, row_p, col_p):
 def dual_phase(tableau, rows, cols):
     """
     Executes the dual phase of the simplex method.
-      1. Find row with negative RHS
-      2. Choose pivot column (most negative coefficient in that row)
-      3. Pivot
-      4. Repeat until all RHS >= 0
-    Returns updated tableau and status ("inviavel" or None).
+    Look for rows with negative RHS (infeasible),
+    then pivot to try to make them non-negative.
     """
     print("Fase Dual:")
+    dual_iter = 0
     while True:
         pivot_row = -1
         pivot_col = -1
         min_rhs = 0
         # Find row with negative RHS in the last column
         for r in range(1, rows):
-            if tableau[r, -1] < -CONFIG.epsilon and (min_rhs == 0 or tableau[r, -1] < min_rhs):
+            if tableau[r, -1] < -CONFIG.epsilon and (
+               min_rhs == 0 or tableau[r, -1] < min_rhs
+            ):
                 min_rhs = tableau[r, -1]
                 pivot_row = r
 
@@ -349,7 +381,7 @@ def dual_phase(tableau, rows, cols):
             print("Fase Dual Concluída\n")
             break
 
-        # Find pivot column in the chosen row (most negative coefficient)
+        # Find pivot column in the chosen row (most negative coefficient in that row)
         min_coef = 0
         for c in range(rows - 1, cols - 1):
             val = tableau[pivot_row, c]
@@ -358,10 +390,12 @@ def dual_phase(tableau, rows, cols):
                 pivot_col = c
 
         if pivot_col < 0:
+            # No valid pivot => problem is infeasible
             print()
             return tableau, "inviavel"
 
-        print(f"Pivoteamento: linha {pivot_row}, coluna {pivot_col}\n")
+        dual_iter += 1
+        print(f"[Dual Iteração {dual_iter}] Pivô: linha {pivot_row}, coluna {pivot_col}\n")
         pivot(tableau, pivot_row, pivot_col)
         print_matrix(tableau)
         print()
@@ -371,25 +405,15 @@ def dual_phase(tableau, rows, cols):
 def primal_phase(tableau, rows, cols):
     """
     Executes the primal phase of the simplex method.
-      1. Choose pivot column (first or most negative coefficient in objective)
-      2. Choose pivot row (minimum ratio test)
-      3. Pivot
-      4. Repeat until no negative coefficients remain
-    Returns updated tableau and status ("otima" or "ilimitada").
+    Look at the objective row (row 0) and try to eliminate negative coefficients.
     """
     print("Fase Primal:")
+    primal_iter = 0
     while True:
-        min_obj_val = 0
-        pivot_col = -1
-        # Find the most negative coefficient in the objective row
-        for c in range(rows - 1, cols - 1):
-            val = tableau[0, c]
-            if val < -CONFIG.epsilon and (min_obj_val == 0 or val < min_obj_val):
-                min_obj_val = val
-                pivot_col = c
-
+        pivot_col = get_pivot_column(tableau, rows, cols)
         if pivot_col < 0:
             print("Fase Primal Concluída\n")
+            # No negative coefficient => optimal
             break
 
         # Minimum ratio test
@@ -403,10 +427,12 @@ def primal_phase(tableau, rows, cols):
                     pivot_row = r
 
         if pivot_row < 0:
+            # No valid pivot => problem is unbounded
             print()
             return tableau, "ilimitada"
 
-        print(f"Pivoteamento: linha {pivot_row}, coluna {pivot_col}\n")
+        primal_iter += 1
+        print(f"[Primal Iteração {primal_iter}] Pivô: linha {pivot_row}, coluna {pivot_col}\n")
         pivot(tableau, pivot_row, pivot_col)
         print_matrix(tableau)
         print()
@@ -490,7 +516,7 @@ def solve_auxiliary(tableau, rows, cols):
     print("Problema Auxiliar:")
     tableau, non_basic, basic = identify_basis_vars(tableau, rows, cols)
 
-    # If we already have a valid basis
+    # If already have a valid basis (no non-basic constraints)
     if len(non_basic) == 0:
         print("Base inicial já existe\n")
         return tableau, "otima"
@@ -513,12 +539,12 @@ def simplex(tableau, rows, cols):
     if status == "inviavel":
         return tableau, status
 
-    # Phase 1: Dual
+    # Phase 1: Dual phase
     tableau, status = dual_phase(tableau, rows, cols)
     if status == "inviavel":
         return tableau, status
 
-    # Phase 2: Primal
+    # Phase 2: Primal phase
     tableau, status = primal_phase(tableau, rows, cols)
     return tableau, status
 
@@ -530,6 +556,7 @@ def setup_test_env():
         "policy": SARGS.policy,
         "number_format": CONFIG.number_format,
     }
+    # Example: Force more decimals/digits during tests
     SARGS.decimals = 7
     SARGS.digits = 7
     SARGS.policy = "largest"
